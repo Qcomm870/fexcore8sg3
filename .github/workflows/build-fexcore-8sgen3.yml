@@ -1,0 +1,349 @@
+name: Build FEXCore UnixLib (.wcp) for Snapdragon 8s Gen 3
+
+# Готовый GitHub Actions workflow для сборки FEXCore (ARM64EC + WOW64 + UnixLib .so)
+# в формате .wcp для Winlator-Ludashi / Winlator Bionic с оптимизациями под Snapdragon 8s Gen 3
+# (1x Cortex-X4 + 4x Cortex-A720 + 3x Cortex-A520; AFP, FlagM2, RCPC2, LSE, FRINT; без SVE/RCPC3).
+#
+# Как запустить с телефона:
+# 1. Создайте пустой репозиторий на GitHub.
+# 2. Нажмите Add file -> Create new file -> укажите путь:
+#    .github/workflows/build-fexcore-8sgen3.yml
+# 3. Вставьте содержимое этого файла и нажмите Commit changes.
+# 4. Откройте вкладку Actions -> Build FEXCore UnixLib (.wcp) for Snapdragon 8s Gen 3 -> Run workflow.
+# 5. Через ~10-15 минут скачайте готовый .wcp из раздела Releases (или Artifacts).
+
+on:
+  workflow_dispatch:
+    inputs:
+      fex_ref:
+        description: 'Тег, ветка или коммит FEX-Emu (например FEX-2611.1 или main)'
+        required: false
+        default: 'FEX-2611.1'
+      unixlib_libc:
+        description: 'Тип libc для unixlib (.so): bionic для Winlator-Ludashi/Bionic, glibc для Linux Proton'
+        type: choice
+        options:
+          - bionic
+          - glibc
+        default: 'bionic'
+      enable_8sgen3_tweaks:
+        description: 'Применить оптимизации под Snapdragon 8s Gen 3 (TSO/Multiblock + флаги Cortex-X4/A720)'
+        type: boolean
+        default: true
+      create_release:
+        description: 'Опубликовать готовый .wcp в GitHub Releases (удобно скачивать с телефона)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-fexcore:
+    name: Build FEXCore (${{ github.event.inputs.unixlib_libc || 'bionic' }})
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl wget git jq zip unzip tar xz-utils zstd file \
+            build-essential cmake ninja-build python3 pkg-config \
+            g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Setup llvm-mingw (ARM64EC + AArch64 PE toolchain)
+        run: |
+          set -euo pipefail
+          LLVM_MINGW_TAG="20251104"
+          TOOLCHAIN_DIR="/opt/llvm-mingw"
+          wget -q "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/llvm-mingw-${LLVM_MINGW_TAG}-ucrt-ubuntu-22.04-x86_64.tar.xz" -O llvm-mingw.tar.xz
+          sudo rm -rf "$TOOLCHAIN_DIR"
+          sudo mkdir -p "$TOOLCHAIN_DIR"
+          sudo tar -C "$TOOLCHAIN_DIR" --strip-components=1 -xJf llvm-mingw.tar.xz
+          rm -f llvm-mingw.tar.xz
+          echo "$TOOLCHAIN_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Clone FEX-Emu
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.fex_ref || 'FEX-2611.1' }}"
+          git clone --depth 1 --branch "$REF" --recurse-submodules --shallow-submodules \
+            https://github.com/FEX-Emu/FEX.git source || {
+              git clone --recurse-submodules https://github.com/FEX-Emu/FEX.git source
+              git -C source checkout "$REF"
+              git -C source submodule update --init --recursive
+            }
+
+          COMMIT_FULL=$(git -C source rev-parse HEAD)
+          COMMIT_SHORT=$(git -C source rev-parse --short HEAD)
+          VER_CLEAN="${REF#FEX-}"
+          LIBC="${{ github.event.inputs.unixlib_libc || 'bionic' }}"
+          PKG_NAME="FEXCore-${VER_CLEAN}-8sGen3-unix-${LIBC}"
+
+          {
+            echo "FEX_REF=${REF}"
+            echo "VER_CLEAN=${VER_CLEAN}"
+            echo "COMMIT_FULL=${COMMIT_FULL}"
+            echo "COMMIT_SHORT=${COMMIT_SHORT}"
+            echo "PKG_NAME=${PKG_NAME}"
+            echo "LIBC=${LIBC}"
+          } >> "$GITHUB_ENV"
+
+          # Передаём OVERRIDE_VERSION, чтобы FEX не получил "FEX-Unknown" при shallow-клоне
+          if grep -q 'set(GIT_DESCRIBE_STRING "FEX-${OVERRIDE_VERSION}")' source/CMakeLists.txt; then
+            echo "FEX_OVERRIDE=-DOVERRIDE_VERSION=${VER_CLEAN}" >> "$GITHUB_ENV"
+          else
+            echo "FEX_OVERRIDE=-DOVERRIDE_VERSION=FEX-${VER_CLEAN}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Apply Snapdragon 8s Gen 3 performance tweaks
+        if: ${{ github.event.inputs.enable_8sgen3_tweaks != 'false' }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import pathlib, re
+
+          # 1. Настройка дефолтов FEXCore под Snapdragon 8s Gen 3 (нет FEAT_LRCPC3 -> ускоряем TSO-путь)
+          # Применяем аккуратно: меняем только известные ключи в FEXCore/ConfigDefines.inl, если найдены.
+          cfg_candidates = list(pathlib.Path("source").rglob("ConfigDefines.inl"))
+          for cfg in cfg_candidates:
+              text = cfg.read_text(encoding="utf-8")
+              orig = text
+              # Отключаем дорогой TSO для векторных и memcpy/memset-операций (официальная рекомендация FEX без LRCPC3)
+              text = re.sub(r'(OPT_BOOL\s*\(\s*VECTORTSOENABLED\s*,\s*)true(\s*,)', r'\1false\2', text)
+              text = re.sub(r'(OPT_BOOL\s*\(\s*MEMCPYSETTSOENABLED\s*,\s*)true(\s*,)', r'\1false\2', text)
+              # Включаем HalfBarrier TSO для невыровненных атомиков и Multiblock JIT
+              text = re.sub(r'(OPT_BOOL\s*\(\s*HALFBARRIERTSOENABLED\s*,\s*)false(\s*,)', r'\1true\2', text)
+              text = re.sub(r'(OPT_BOOL\s*\(\s*MULTIBLOCK\s*,\s*)false(\s*,)', r'\1true\2', text)
+              # Увеличиваем лимит инструкций на блок до 5000 (уменьшает переходы между блоками JIT)
+              text = re.sub(r'(OPT_UINT\s*\(\s*MAXINST\s*,\s*)\d+(\s*,)', r'\15000\2', text)
+              if text != orig:
+                  cfg.write_text(text, encoding="utf-8")
+                  print(f"Patched defaults in {cfg}")
+          PY
+
+      - name: Build FEXCore PE DLLs (ARM64EC + WOW64)
+        run: |
+          set -euo pipefail
+          cd source
+          TOOLCHAIN="$PWD/Data/CMake/toolchain_mingw.cmake"
+          [ -f "$TOOLCHAIN" ] || TOOLCHAIN="$PWD/toolchain_mingw.cmake"
+
+          # ВАЖНО: для ARM64EC/MinGW необходимо -DTUNE_CPU=none, иначе clang может упасть
+          # с ошибкой ".seh directives corresponding to" (см. FEX-Emu Development:ARM64EC Wiki).
+          # Аппаратные фичи Snapdragon 8s Gen 3 (AFP, FlagM2, RCPC2, FRINT, LSE) FEXCore
+          # определяет динамически в рантайме через cpuid/hwcap.
+          build_dll() {
+            local triple="$1"
+            local stage="$2"
+            local dir="build-${triple}"
+            rm -rf "$dir" && mkdir -p "$dir"
+            cmake -S . -B "$dir" -G Ninja -Wno-dev \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+              -DMINGW_TRIPLE="${triple}-w64-mingw32" \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows \
+              -DTUNE_ARCH=generic \
+              -DTUNE_CPU=none \
+              -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+              -DENABLE_LTO=False \
+              -DENABLE_ASSERTIONS=False \
+              -DBUILD_TESTING=False \
+              -DBUILD_TESTS=False \
+              ${FEX_OVERRIDE:+"$FEX_OVERRIDE"}
+            ninja -C "$dir" -j "$(nproc)"
+            DESTDIR="$stage" ninja -C "$dir" install
+          }
+
+          build_dll "arm64ec" "$GITHUB_WORKSPACE/stage-ec"
+          build_dll "aarch64" "$GITHUB_WORKSPACE/stage-wow"
+
+      - name: Build FEXCore UnixLib (.so)
+        run: |
+          set -euo pipefail
+          UNIX_SRC="source/Source/Windows/UnixLib"
+          if [ ! -f "$UNIX_SRC/FEXUnixLib.cpp" ]; then
+            echo "::warning::Выбранная версия FEX (${FEX_REF}) не содержит UnixLib (добавлен в FEX-2607+)."
+            echo "HAS_UNIXLIB=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Подбираем безопасные флаги под Snapdragon 8s Gen 3 (ARMv9.2 без SVE: Cortex-X4 / A720 / A520)
+          OPT_FLAGS="-O3"
+          if [ "${{ github.event.inputs.enable_8sgen3_tweaks != 'false' }}" = "true" ]; then
+            OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto -mtune=cortex-x4"
+          fi
+
+          if [ "$LIBC" = "bionic" ]; then
+            NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+            if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+              echo "::error::Android NDK не найден на раннере"
+              exit 1
+            fi
+            echo "Using Android NDK: $NDK"
+
+            # На Android Bionic нет отдельной librt и функций shm_open/shm_unlink —
+            # аккуратно патчим CMakeLists.txt (убираем -lrt) и добавляем shim-заглушки при необходимости.
+            python3 - << 'PY'
+            import pathlib, re
+
+            cm = pathlib.Path("source/Source/Windows/UnixLib/CMakeLists.txt")
+            if cm.exists():
+                txt = cm.read_text(encoding="utf-8")
+                txt = re.sub(r'\brt\b', '', txt)
+                cm.write_text(txt, encoding="utf-8")
+
+            cpp = pathlib.Path("source/Source/Windows/UnixLib/FEXUnixLib.cpp")
+            src = cpp.read_text(encoding="utf-8")
+            if ("shm_open" in src or "shm_unlink" in src) and "__ANDROID__" not in src:
+                shim = """
+            #if defined(__ANDROID__)
+            #include <errno.h>
+            #include <fcntl.h>
+            #include <sys/stat.h>
+            static inline int fex_bionic_shm_open(const char*, int, mode_t) { errno = ENOSYS; return -1; }
+            static inline int fex_bionic_shm_unlink(const char*) { errno = ENOSYS; return -1; }
+            #define shm_open fex_bionic_shm_open
+            #define shm_unlink fex_bionic_shm_unlink
+            #endif
+            """
+                cpp.write_text(shim + "\n" + src, encoding="utf-8")
+                print("Injected Android Bionic shm_open/shm_unlink shim")
+            PY
+
+            # Проверяем, поддерживает ли NDK clang -mtune=cortex-x4
+            NDK_CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+            if ! "$NDK_CLANG" $OPT_FLAGS -x c++ -c /dev/null -o /dev/null 2>/dev/null; then
+              OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto"
+            fi
+            echo "UnixLib (bionic) CXXFLAGS: $OPT_FLAGS"
+
+            cmake -S "$UNIX_SRC" -B build-unix -G Ninja -Wno-dev \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a \
+              -DANDROID_PLATFORM=android-28 \
+              -DCMAKE_CXX_FLAGS="$OPT_FLAGS" \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_INSTALL_LIBDIR=lib/wine/aarch64-unix
+            ninja -C build-unix -j "$(nproc)"
+            DESTDIR="$GITHUB_WORKSPACE/stage-unix" ninja -C build-unix install
+
+            NDK_STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+            echo "UNIX_STRIP=$NDK_STRIP" >> "$GITHUB_ENV"
+          else
+            # Вариант glibc (для Linux/glibc Proton)
+            if ! aarch64-linux-gnu-g++ $OPT_FLAGS -x c++ -c /dev/null -o /dev/null 2>/dev/null; then
+              OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto"
+            fi
+            echo "UnixLib (glibc) CXXFLAGS: $OPT_FLAGS"
+
+            cmake -S "$UNIX_SRC" -B build-unix -G Ninja -Wno-dev \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+              -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+              -DCMAKE_CXX_FLAGS="$OPT_FLAGS" \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_INSTALL_LIBDIR=lib/wine/aarch64-unix
+            ninja -C build-unix -j "$(nproc)"
+            DESTDIR="$GITHUB_WORKSPACE/stage-unix" ninja -C build-unix install
+            echo "UNIX_STRIP=aarch64-linux-gnu-strip" >> "$GITHUB_ENV"
+          fi
+
+          echo "HAS_UNIXLIB=1" >> "$GITHUB_ENV"
+
+      - name: Package .wcp (Winlator-Ludashi / Bionic format)
+        run: |
+          set -euo pipefail
+          PKG="$GITHUB_WORKSPACE/pkg"
+          rm -rf "$PKG" out
+          mkdir -p "$PKG/system32" out
+
+          DLL_EC=$(find stage-ec -type f -name '*.dll' | head -n 1)
+          DLL_WOW=$(find stage-wow -type f -name '*.dll' | head -n 1)
+          cp "$DLL_EC" "$PKG/system32/libarm64ecfex.dll"
+          cp "$DLL_WOW" "$PKG/system32/libwow64fex.dll"
+          /opt/llvm-mingw/bin/llvm-strip --strip-all "$PKG/system32"/*.dll
+
+          if [ "$HAS_UNIXLIB" = "1" ]; then
+            mkdir -p "$PKG/aarch64-unix"
+            for name in libarm64ecfex libwow64fex; do
+              SO_FILE=$(find stage-unix -type f -name "${name}.so" | head -n 1)
+              cp "$SO_FILE" "$PKG/aarch64-unix/${name}.so"
+            done
+            "$UNIX_STRIP" --strip-unneeded "$PKG/aarch64-unix"/*.so
+            chmod 0755 "$PKG/aarch64-unix"/*.so
+
+            cat > "$PKG/profile.json" << EOF
+          {
+            "type": "FEXCore",
+            "versionName": "${PKG_NAME}",
+            "versionCode": ${GITHUB_RUN_NUMBER},
+            "description": "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), tuned for Snapdragon 8s Gen 3",
+            "author": "FEX-Emu (Custom 8s Gen 3 Build)",
+            "files": [
+              { "source": "system32/libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll" },
+              { "source": "system32/libwow64fex.dll", "target": "\${system32}/libwow64fex.dll" },
+              { "source": "aarch64-unix/libarm64ecfex.so", "target": "\${libdir}/wine/aarch64-unix/libarm64ecfex.so" },
+              { "source": "aarch64-unix/libwow64fex.so", "target": "\${libdir}/wine/aarch64-unix/libwow64fex.so" }
+            ]
+          }
+          EOF
+          else
+            cat > "$PKG/profile.json" << EOF
+          {
+            "type": "FEXCore",
+            "versionName": "${PKG_NAME}",
+            "versionCode": ${GITHUB_RUN_NUMBER},
+            "description": "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), tuned for Snapdragon 8s Gen 3 (DLL-only)",
+            "author": "FEX-Emu (Custom 8s Gen 3 Build)",
+            "files": [
+              { "source": "system32/libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll" },
+              { "source": "system32/libwow64fex.dll", "target": "\${system32}/libwow64fex.dll" }
+            ]
+          }
+          EOF
+          fi
+
+          # Проверка собранных бинарников и profile.json
+          jq empty "$PKG/profile.json"
+          file "$PKG/system32/libwow64fex.dll" | grep -q 'PE32+ executable.*Aarch64'
+          llvm-readobj --coff-load-config "$PKG/system32/libarm64ecfex.dll" | grep -q 'CHPEMetadata'
+
+          if [ "$HAS_UNIXLIB" = "1" ]; then
+            for f in "$PKG/aarch64-unix"/*.so; do
+              file "$f" | grep -q 'ELF 64-bit LSB shared object, ARM aarch64'
+              aarch64-linux-gnu-readelf --dyn-syms -W "$f" | grep -q '__wine_unix_call_funcs'
+            done
+          fi
+
+          # Упаковка в .wcp (tar + zstd)
+          ( cd "$PKG" && tar --owner=0 --group=0 -cf - . | zstd -19 -q -o "$GITHUB_WORKSPACE/out/${PKG_NAME}.wcp" )
+          ls -lh "$GITHUB_WORKSPACE/out/${PKG_NAME}.wcp"
+
+      - name: Upload .wcp Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: out/*.wcp
+
+      - name: Create GitHub Release (easy phone download)
+        if: ${{ github.event.inputs.create_release != 'false' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ env.PKG_NAME }}-r${{ github.run_number }}"
+          name: "${{ env.PKG_NAME }}"
+          body: |
+            ### FEXCore для Winlator-Ludashi (Snapdragon 8s Gen 3)
+            - **Версия FEX**: `${{ env.FEX_REF }}` (`${{ env.COMMIT_SHORT }}`)
+            - **UnixLib**: `${{ env.LIBC }}` (`HAS_UNIXLIB=${{ env.HAS_UNIXLIB }}`)
+            - **Оптимизации 8s Gen 3**: `${{ github.event.inputs.enable_8sgen3_tweaks }}`
+            - **Установка**: Winlator → **Settings → Contents → Install Content** → выберите `${{ env.PKG_NAME }}.wcp`.
+          files: out/*.wcp
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
