@@ -3,14 +3,6 @@ name: Build FEXCore UnixLib (.wcp) for Snapdragon 8s Gen 3
 # Готовый GitHub Actions workflow для сборки FEXCore (ARM64EC + WOW64 + UnixLib .so)
 # в формате .wcp для Winlator-Ludashi / Winlator Bionic с оптимизациями под Snapdragon 8s Gen 3
 # (1x Cortex-X4 + 4x Cortex-A720 + 3x Cortex-A520; AFP, FlagM2, RCPC2, LSE, FRINT; без SVE/RCPC3).
-#
-# Как запустить с телефона:
-# 1. Создайте пустой репозиторий на GitHub.
-# 2. Нажмите Add file -> Create new file -> укажите путь:
-#    .github/workflows/build-fexcore-8sgen3.yml
-# 3. Вставьте содержимое этого файла и нажмите Commit changes.
-# 4. Откройте вкладку Actions -> Build FEXCore UnixLib (.wcp) for Snapdragon 8s Gen 3 -> Run workflow.
-# 5. Через ~10-15 минут скачайте готовый .wcp из раздела Releases (или Artifacts).
 
 on:
   workflow_dispatch:
@@ -91,7 +83,6 @@ jobs:
             echo "LIBC=${LIBC}"
           } >> "$GITHUB_ENV"
 
-          # Передаём OVERRIDE_VERSION, чтобы FEX не получил "FEX-Unknown" при shallow-клоне
           if grep -q 'set(GIT_DESCRIBE_STRING "FEX-${OVERRIDE_VERSION}")' source/CMakeLists.txt; then
             echo "FEX_OVERRIDE=-DOVERRIDE_VERSION=${VER_CLEAN}" >> "$GITHUB_ENV"
           else
@@ -105,19 +96,14 @@ jobs:
           python3 - << 'PY'
           import pathlib, re
 
-          # 1. Настройка дефолтов FEXCore под Snapdragon 8s Gen 3 (нет FEAT_LRCPC3 -> ускоряем TSO-путь)
-          # Применяем аккуратно: меняем только известные ключи в FEXCore/ConfigDefines.inl, если найдены.
           cfg_candidates = list(pathlib.Path("source").rglob("ConfigDefines.inl"))
           for cfg in cfg_candidates:
               text = cfg.read_text(encoding="utf-8")
               orig = text
-              # Отключаем дорогой TSO для векторных и memcpy/memset-операций (официальная рекомендация FEX без LRCPC3)
               text = re.sub(r'(OPT_BOOL\s*\(\s*VECTORTSOENABLED\s*,\s*)true(\s*,)', r'\1false\2', text)
               text = re.sub(r'(OPT_BOOL\s*\(\s*MEMCPYSETTSOENABLED\s*,\s*)true(\s*,)', r'\1false\2', text)
-              # Включаем HalfBarrier TSO для невыровненных атомиков и Multiblock JIT
               text = re.sub(r'(OPT_BOOL\s*\(\s*HALFBARRIERTSOENABLED\s*,\s*)false(\s*,)', r'\1true\2', text)
               text = re.sub(r'(OPT_BOOL\s*\(\s*MULTIBLOCK\s*,\s*)false(\s*,)', r'\1true\2', text)
-              # Увеличиваем лимит инструкций на блок до 5000 (уменьшает переходы между блоками JIT)
               text = re.sub(r'(OPT_UINT\s*\(\s*MAXINST\s*,\s*)\d+(\s*,)', r'\15000\2', text)
               if text != orig:
                   cfg.write_text(text, encoding="utf-8")
@@ -131,10 +117,6 @@ jobs:
           TOOLCHAIN="$PWD/Data/CMake/toolchain_mingw.cmake"
           [ -f "$TOOLCHAIN" ] || TOOLCHAIN="$PWD/toolchain_mingw.cmake"
 
-          # ВАЖНО: для ARM64EC/MinGW необходимо -DTUNE_CPU=none, иначе clang может упасть
-          # с ошибкой ".seh directives corresponding to" (см. FEX-Emu Development:ARM64EC Wiki).
-          # Аппаратные фичи Snapdragon 8s Gen 3 (AFP, FlagM2, RCPC2, FRINT, LSE) FEXCore
-          # определяет динамически в рантайме через cpuid/hwcap.
           build_dll() {
             local triple="$1"
             local stage="$2"
@@ -171,7 +153,6 @@ jobs:
             exit 0
           fi
 
-          # Подбираем безопасные флаги под Snapdragon 8s Gen 3 (ARMv9.2 без SVE: Cortex-X4 / A720 / A520)
           OPT_FLAGS="-O3"
           if [ "${{ github.event.inputs.enable_8sgen3_tweaks != 'false' }}" = "true" ]; then
             OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto -mtune=cortex-x4"
@@ -185,36 +166,32 @@ jobs:
             fi
             echo "Using Android NDK: $NDK"
 
-            # На Android Bionic нет отдельной librt и функций shm_open/shm_unlink —
-            # аккуратно патчим CMakeLists.txt (убираем -lrt) и добавляем shim-заглушки при необходимости.
             python3 - << 'PY'
-            import pathlib, re
+          import pathlib, re
 
-            cm = pathlib.Path("source/Source/Windows/UnixLib/CMakeLists.txt")
-            if cm.exists():
-                txt = cm.read_text(encoding="utf-8")
-                txt = re.sub(r'\brt\b', '', txt)
-                cm.write_text(txt, encoding="utf-8")
+          cm = pathlib.Path("source/Source/Windows/UnixLib/CMakeLists.txt")
+          if cm.exists():
+              txt = cm.read_text(encoding="utf-8")
+              txt = re.sub(r'\brt\b', '', txt)
+              cm.write_text(txt, encoding="utf-8")
 
-            cpp = pathlib.Path("source/Source/Windows/UnixLib/FEXUnixLib.cpp")
-            src = cpp.read_text(encoding="utf-8")
-            if ("shm_open" in src or "shm_unlink" in src) and "__ANDROID__" not in src:
-                shim = """
-            #if defined(__ANDROID__)
-            #include <errno.h>
-            #include <fcntl.h>
-            #include <sys/stat.h>
-            static inline int fex_bionic_shm_open(const char*, int, mode_t) { errno = ENOSYS; return -1; }
-            static inline int fex_bionic_shm_unlink(const char*) { errno = ENOSYS; return -1; }
-            #define shm_open fex_bionic_shm_open
-            #define shm_unlink fex_bionic_shm_unlink
-            #endif
-            """
-                cpp.write_text(shim + "\n" + src, encoding="utf-8")
-                print("Injected Android Bionic shm_open/shm_unlink shim")
-            PY
+          cpp = pathlib.Path("source/Source/Windows/UnixLib/FEXUnixLib.cpp")
+          src = cpp.read_text(encoding="utf-8")
+          if ("shm_open" in src or "shm_unlink" in src) and "__ANDROID__" not in src:
+              shim = """#if defined(__ANDROID__)
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <sys/stat.h>
+          static inline int fex_bionic_shm_open(const char*, int, mode_t) { errno = ENOSYS; return -1; }
+          static inline int fex_bionic_shm_unlink(const char*) { errno = ENOSYS; return -1; }
+          #define shm_open fex_bionic_shm_open
+          #define shm_unlink fex_bionic_shm_unlink
+          #endif
+          """
+              cpp.write_text(shim + "\n" + src, encoding="utf-8")
+              print("Injected Android Bionic shm_open/shm_unlink shim")
+          PY
 
-            # Проверяем, поддерживает ли NDK clang -mtune=cortex-x4
             NDK_CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
             if ! "$NDK_CLANG" $OPT_FLAGS -x c++ -c /dev/null -o /dev/null 2>/dev/null; then
               OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto"
@@ -235,7 +212,6 @@ jobs:
             NDK_STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
             echo "UNIX_STRIP=$NDK_STRIP" >> "$GITHUB_ENV"
           else
-            # Вариант glibc (для Linux/glibc Proton)
             if ! aarch64-linux-gnu-g++ $OPT_FLAGS -x c++ -c /dev/null -o /dev/null 2>/dev/null; then
               OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto"
             fi
@@ -278,38 +254,41 @@ jobs:
             "$UNIX_STRIP" --strip-unneeded "$PKG/aarch64-unix"/*.so
             chmod 0755 "$PKG/aarch64-unix"/*.so
 
-            cat > "$PKG/profile.json" << EOF
-          {
-            "type": "FEXCore",
-            "versionName": "${PKG_NAME}",
-            "versionCode": ${GITHUB_RUN_NUMBER},
-            "description": "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), tuned for Snapdragon 8s Gen 3",
-            "author": "FEX-Emu (Custom 8s Gen 3 Build)",
-            "files": [
-              { "source": "system32/libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll" },
-              { "source": "system32/libwow64fex.dll", "target": "\${system32}/libwow64fex.dll" },
-              { "source": "aarch64-unix/libarm64ecfex.so", "target": "\${libdir}/wine/aarch64-unix/libarm64ecfex.so" },
-              { "source": "aarch64-unix/libwow64fex.so", "target": "\${libdir}/wine/aarch64-unix/libwow64fex.so" }
-            ]
-          }
-          EOF
+            jq -n \
+              --arg vn "${PKG_NAME}" \
+              --argjson vc "${GITHUB_RUN_NUMBER}" \
+              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), tuned for Snapdragon 8s Gen 3" \
+              '{
+                type: "FEXCore",
+                versionName: $vn,
+                versionCode: $vc,
+                description: $desc,
+                author: "FEX-Emu (Custom 8s Gen 3 Build)",
+                files: [
+                  { source: "system32/libarm64ecfex.dll", target: "${system32}/libarm64ecfex.dll" },
+                  { source: "system32/libwow64fex.dll", target: "${system32}/libwow64fex.dll" },
+                  { source: "aarch64-unix/libarm64ecfex.so", target: "${libdir}/wine/aarch64-unix/libarm64ecfex.so" },
+                  { source: "aarch64-unix/libwow64fex.so", target: "${libdir}/wine/aarch64-unix/libwow64fex.so" }
+                ]
+              }' > "$PKG/profile.json"
           else
-            cat > "$PKG/profile.json" << EOF
-          {
-            "type": "FEXCore",
-            "versionName": "${PKG_NAME}",
-            "versionCode": ${GITHUB_RUN_NUMBER},
-            "description": "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), tuned for Snapdragon 8s Gen 3 (DLL-only)",
-            "author": "FEX-Emu (Custom 8s Gen 3 Build)",
-            "files": [
-              { "source": "system32/libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll" },
-              { "source": "system32/libwow64fex.dll", "target": "\${system32}/libwow64fex.dll" }
-            ]
-          }
-          EOF
+            jq -n \
+              --arg vn "${PKG_NAME}" \
+              --argjson vc "${GITHUB_RUN_NUMBER}" \
+              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), tuned for Snapdragon 8s Gen 3 (DLL-only)" \
+              '{
+                type: "FEXCore",
+                versionName: $vn,
+                versionCode: $vc,
+                description: $desc,
+                author: "FEX-Emu (Custom 8s Gen 3 Build)",
+                files: [
+                  { source: "system32/libarm64ecfex.dll", target: "${system32}/libarm64ecfex.dll" },
+                  { source: "system32/libwow64fex.dll", target: "${system32}/libwow64fex.dll" }
+                ]
+              }' > "$PKG/profile.json"
           fi
 
-          # Проверка собранных бинарников и profile.json
           jq empty "$PKG/profile.json"
           file "$PKG/system32/libwow64fex.dll" | grep -q 'PE32+ executable.*Aarch64'
           llvm-readobj --coff-load-config "$PKG/system32/libarm64ecfex.dll" | grep -q 'CHPEMetadata'
@@ -321,7 +300,6 @@ jobs:
             done
           fi
 
-          # Упаковка в .wcp (tar + zstd)
           ( cd "$PKG" && tar --owner=0 --group=0 -cf - . | zstd -19 -q -o "$GITHUB_WORKSPACE/out/${PKG_NAME}.wcp" )
           ls -lh "$GITHUB_WORKSPACE/out/${PKG_NAME}.wcp"
 
@@ -346,4 +324,3 @@ jobs:
           files: out/*.wcp
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
