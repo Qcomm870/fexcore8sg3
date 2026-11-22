@@ -1,8 +1,9 @@
 name: Build FEXCore UnixLib (.wcp) for Snapdragon 8s Gen 3
 
 # GitHub Actions workflow для сборки FEXCore (ARM64EC + WOW64 + UnixLib .so)
-# в формате .wcp для Winlator-Ludashi / Winlator Bionic с реальными оптимизациями
-# через FEXCore/Source/Interface/Config/Config.json.in и выбором сборки: с логом или без лога.
+# в формате .wcp для Winlator-Ludashi / Winlator Bionic.
+# Оптимизирован под Snapdragon 8s Gen 3 + тяжёлые игры уровня Cyberpunk 2077
+# (низкое потребление RAM без свопа zRAM, снижение нагрузки/нагрева CPU, выбор сборки с логом или без).
 
 on:
   workflow_dispatch:
@@ -19,14 +20,14 @@ on:
           - glibc
         default: 'bionic'
       perf_profile:
-        description: 'Профиль оптимизаций: balanced (стабильнее, TSO on) или max_fps (TSO off, макс. FPS в CP2077)'
+        description: 'Профиль: max_fps (TSO off + SMC none, макс. FPS в CP2077) или balanced (TSO on + SMC mtrack)'
         type: choice
         options:
           - max_fps
           - balanced
         default: 'max_fps'
       enable_fex_logging:
-        description: 'Сборка с логированием и телеметрией FEX (пишет в D:\\fexcore.log и D:\\fex_telemetry)'
+        description: 'Сборка с логированием FEX (пишет в /storage/emulated/0/Download/fexcore.log)'
         type: boolean
         default: false
       create_release:
@@ -86,7 +87,7 @@ jobs:
           else
             LOG_TAG="nolog"
           fi
-          PKG_NAME="FEXCore-${VER_CLEAN}-8sGen3-${PROFILE}-${LOG_TAG}-unix-${LIBC}"
+          PKG_NAME="FEXCore-${VER_CLEAN}-8sGen3-v2-${PROFILE}-${LOG_TAG}-unix-${LIBC}"
 
           {
             echo "FEX_REF=${REF}"
@@ -105,7 +106,7 @@ jobs:
             echo "FEX_OVERRIDE=-DOVERRIDE_VERSION=FEX-${VER_CLEAN}" >> "$GITHUB_ENV"
           fi
 
-      - name: Patch Config.json.in (8s Gen 3 optimizations + logging mode)
+      - name: Patch Config.json.in (8s Gen 3 low-RAM / low-heat / max-FPS tuning)
         run: |
           set -euo pipefail
           python3 - << 'PY'
@@ -129,20 +130,19 @@ jobs:
               else:
                   print(f"[SKIP]  {section}.{key} not found in this FEX version")
 
-          # --- 1. Ускорение JIT-кэша и снижение статтеров (главное для Cyberpunk 2077) ---
-          # Включаем L2-кэш JIT (по умолчанию отключён ради экономии ОЗУ)
-          set_default("Emulation", "DisableL2Cache", "false")
-          # Отключаем динамическое сжатие L1-кэша JIT (убирает микрофризы при смене сцен)
-          set_default("Emulation", "DynamicL1Cache", "false")
-          # Включаем дисковый кэш скомпилированных JIT-блоков
-          set_default("CPU", "DiskCache", "true")
-          set_default("CPU", "DiskCacheFileMapping", "true")
+          # --- 1. Экономия RAM (убираем своп zRAM при 85-89% занятой ОЗУ в CP2077) ---
+          set_default("Emulation", "DisableL2Cache", "true")
+          set_default("Emulation", "DynamicL1Cache", "true")
+          set_default("Emulation", "DynamicL1CacheIncreaseCountHeuristic", "150")
+          set_default("Emulation", "DynamicL1CacheDecreaseCountHeuristic", "15")
+          set_default("CPU", "DiskCache", "false")
           set_default("CPU", "Multiblock", "true")
-          set_default("CPU", "MaxInst", "5000")
+          # Уменьшаем MaxInst с 5000 до 2500: меньше пиков CPU/RAM при компиляции JIT-блоков
+          set_default("CPU", "MaxInst", "2500")
           set_default("CPU", "SmallTSCScale", "true")
           set_default("CPU", "HideHybrid", "true")
 
-          # --- 2. Оптимизации TSO и x87 под Snapdragon 8s Gen 3 (без FEAT_LRCPC3) ---
+          # --- 2. Разгрузка CPU под Snapdragon 8s Gen 3 (без FEAT_LRCPC3) ---
           set_default("Hacks", "VectorTSOEnabled", "false")
           set_default("Hacks", "MemcpySetTSOEnabled", "false")
           set_default("Hacks", "HalfBarrierTSOEnabled", "true")
@@ -151,16 +151,18 @@ jobs:
           set_default("Hacks", "X87ReducedPrecision", "true")
 
           if profile == "max_fps":
-              # Отключение полного TSO даёт самый сильный прирост CPU FPS на Snapdragon без LRCPC3
               set_default("Hacks", "TSOEnabled", "false")
+              # Убираем page-tracking проверки SMC (снижает нагрузку на CPU в нативных x64-играх вроде CP2077)
+              set_default("Hacks", "SMCChecks", "FEXCore::Config::CONFIG_SMC_NONE")
           else:
               set_default("Hacks", "TSOEnabled", "true")
+              set_default("Hacks", "SMCChecks", "FEXCore::Config::CONFIG_SMC_MTRACK")
 
-          # --- 3. Режим логирования / телеметрии vs чистая сборка без оверхеда ---
+          # --- 3. Логирование (Android Linux-путь в Download) vs чистый Max FPS ---
           if log_enabled:
               set_default("Logging", "SilentLog", "false")
-              set_default("Logging", "OutputLog", "D:\\fexcore.log")
-              set_default("Logging", "TelemetryDirectory", "D:\\fex_telemetry")
+              set_default("Logging", "OutputLog", "/storage/emulated/0/Download/fexcore.log")
+              set_default("Logging", "TelemetryDirectory", "/storage/emulated/0/Download/fex_telemetry")
               set_default("Logging", "ProfileStats", "true")
               set_default("Debug", "DisableTelemetry", "false")
           else:
@@ -310,7 +312,6 @@ jobs:
           cp "$DLL_EC" "$PKG/system32/libarm64ecfex.dll"
           cp "$DLL_WOW" "$PKG/system32/libwow64fex.dll"
 
-          # В сборке без лога полностью вырезаем символы; в лог-сборке сохраняем C-отладку
           if [ "$LOG_ENABLED" != "true" ]; then
             /opt/llvm-mingw/bin/llvm-strip --strip-all "$PKG/system32"/*.dll
           fi
@@ -327,13 +328,13 @@ jobs:
             jq -n \
               --arg vn "${PKG_NAME}" \
               --argjson vc "${GITHUB_RUN_NUMBER}" \
-              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), 8s Gen 3 ${PERF_PROFILE}, log=${LOG_ENABLED}" \
+              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), 8s Gen 3 v2 ${PERF_PROFILE}, log=${LOG_ENABLED}" \
               '{
                 type: "FEXCore",
                 versionName: $vn,
                 versionCode: $vc,
                 description: $desc,
-                author: "FEX-Emu (Custom 8s Gen 3 Build)",
+                author: "FEX-Emu (Custom 8s Gen 3 v2)",
                 files: [
                   { source: "system32/libarm64ecfex.dll", target: "${system32}/libarm64ecfex.dll" },
                   { source: "system32/libwow64fex.dll", target: "${system32}/libwow64fex.dll" },
@@ -345,13 +346,13 @@ jobs:
             jq -n \
               --arg vn "${PKG_NAME}" \
               --argjson vc "${GITHUB_RUN_NUMBER}" \
-              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), 8s Gen 3 ${PERF_PROFILE}, log=${LOG_ENABLED} (DLL-only)" \
+              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), 8s Gen 3 v2 ${PERF_PROFILE}, log=${LOG_ENABLED} (DLL-only)" \
               '{
                 type: "FEXCore",
                 versionName: $vn,
                 versionCode: $vc,
                 description: $desc,
-                author: "FEX-Emu (Custom 8s Gen 3 Build)",
+                author: "FEX-Emu (Custom 8s Gen 3 v2)",
                 files: [
                   { source: "system32/libarm64ecfex.dll", target: "${system32}/libarm64ecfex.dll" },
                   { source: "system32/libwow64fex.dll", target: "${system32}/libwow64fex.dll" }
@@ -386,12 +387,11 @@ jobs:
           tag_name: "${{ env.PKG_NAME }}-r${{ github.run_number }}"
           name: "${{ env.PKG_NAME }}"
           body: |
-            ### FEXCore для Winlator-Ludashi (Snapdragon 8s Gen 3)
+            ### FEXCore v2 для Winlator-Ludashi (Snapdragon 8s Gen 3)
             - **Версия FEX**: `${{ env.FEX_REF }}` (`${{ env.COMMIT_SHORT }}`)
-            - **Профиль**: `${{ env.PERF_PROFILE }}` (L1/L2 JIT-кэш + DiskCache + Fast x87)
-            - **Логирование FEX**: `${{ env.LOG_ENABLED }}` (`D:\fexcore.log` и `D:\fex_telemetry` при включении)
+            - **Профиль**: `${{ env.PERF_PROFILE }}` (low-RAM L1/L2, `MaxInst=2500`, `TSO=false` + `SMC=none` в `max_fps`)
+            - **Логирование FEX**: `${{ env.LOG_ENABLED }}` (`/storage/emulated/0/Download/fexcore.log`)
             - **UnixLib**: `${{ env.LIBC }}` (`HAS_UNIXLIB=${{ env.HAS_UNIXLIB }}`)
-            - **Установка**: Winlator → **Settings → Contents → Install Content** → выберите `${{ env.PKG_NAME }}.wcp`.
           files: out/*.wcp
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
