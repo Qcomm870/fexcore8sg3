@@ -48,6 +48,23 @@ jobs:
           git clone --recursive --depth 1 --branch "${{ inputs.vkd3d_tag }}" \
             https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d-proton
 
+      - name: Fix modern libc++ headers for v2.13 (missing <exception>)
+        run: |
+          python3 - << 'PY'
+          import pathlib
+
+          patched = 0
+          for path in pathlib.Path("vkd3d-proton").rglob("*"):
+              if path.suffix not in (".hpp", ".h", ".cpp"):
+                  continue
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              if "std::terminate" in text and "<exception>" not in text:
+                  path.write_text("#include <exception>\n" + text, encoding="utf-8")
+                  print(f"Added <exception> to {path}")
+                  patched += 1
+          print(f"Total header fixes: {patched}")
+          PY
+
       - name: Apply Snapdragon 8s Gen 3 tweaks
         if: ${{ inputs.silence_swapchain_spam }}
         run: |
