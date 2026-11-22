@@ -1,8 +1,8 @@
 name: Build FEXCore UnixLib (.wcp) for Snapdragon 8s Gen 3
 
-# Готовый GitHub Actions workflow для сборки FEXCore (ARM64EC + WOW64 + UnixLib .so)
-# в формате .wcp для Winlator-Ludashi / Winlator Bionic с оптимизациями под Snapdragon 8s Gen 3
-# (1x Cortex-X4 + 4x Cortex-A720 + 3x Cortex-A520; AFP, FlagM2, RCPC2, LSE, FRINT; без SVE/RCPC3).
+# GitHub Actions workflow для сборки FEXCore (ARM64EC + WOW64 + UnixLib .so)
+# в формате .wcp для Winlator-Ludashi / Winlator Bionic с реальными оптимизациями
+# через FEXCore/Source/Interface/Config/Config.json.in и выбором сборки: с логом или без лога.
 
 on:
   workflow_dispatch:
@@ -18,10 +18,17 @@ on:
           - bionic
           - glibc
         default: 'bionic'
-      enable_8sgen3_tweaks:
-        description: 'Применить оптимизации под Snapdragon 8s Gen 3 (TSO/Multiblock + флаги Cortex-X4/A720)'
+      perf_profile:
+        description: 'Профиль оптимизаций: balanced (стабильнее, TSO on) или max_fps (TSO off, макс. FPS в CP2077)'
+        type: choice
+        options:
+          - max_fps
+          - balanced
+        default: 'max_fps'
+      enable_fex_logging:
+        description: 'Сборка с логированием и телеметрией FEX (пишет в D:\\fexcore.log и D:\\fex_telemetry)'
         type: boolean
-        default: true
+        default: false
       create_release:
         description: 'Опубликовать готовый .wcp в GitHub Releases (удобно скачивать с телефона)'
         type: boolean
@@ -32,7 +39,7 @@ permissions:
 
 jobs:
   build-fexcore:
-    name: Build FEXCore (${{ github.event.inputs.unixlib_libc || 'bionic' }})
+    name: Build FEXCore (${{ github.event.inputs.perf_profile || 'max_fps' }} / log=${{ github.event.inputs.enable_fex_logging || 'false' }})
     runs-on: ubuntu-24.04
 
     steps:
@@ -72,7 +79,14 @@ jobs:
           COMMIT_SHORT=$(git -C source rev-parse --short HEAD)
           VER_CLEAN="${REF#FEX-}"
           LIBC="${{ github.event.inputs.unixlib_libc || 'bionic' }}"
-          PKG_NAME="FEXCore-${VER_CLEAN}-8sGen3-unix-${LIBC}"
+          PROFILE="${{ github.event.inputs.perf_profile || 'max_fps' }}"
+          LOG_ENABLED="${{ github.event.inputs.enable_fex_logging || 'false' }}"
+          if [ "$LOG_ENABLED" = "true" ]; then
+            LOG_TAG="log"
+          else
+            LOG_TAG="nolog"
+          fi
+          PKG_NAME="FEXCore-${VER_CLEAN}-8sGen3-${PROFILE}-${LOG_TAG}-unix-${LIBC}"
 
           {
             echo "FEX_REF=${REF}"
@@ -81,6 +95,8 @@ jobs:
             echo "COMMIT_SHORT=${COMMIT_SHORT}"
             echo "PKG_NAME=${PKG_NAME}"
             echo "LIBC=${LIBC}"
+            echo "PERF_PROFILE=${PROFILE}"
+            echo "LOG_ENABLED=${LOG_ENABLED}"
           } >> "$GITHUB_ENV"
 
           if grep -q 'set(GIT_DESCRIBE_STRING "FEX-${OVERRIDE_VERSION}")' source/CMakeLists.txt; then
@@ -89,25 +105,71 @@ jobs:
             echo "FEX_OVERRIDE=-DOVERRIDE_VERSION=FEX-${VER_CLEAN}" >> "$GITHUB_ENV"
           fi
 
-      - name: Apply Snapdragon 8s Gen 3 performance tweaks
-        if: ${{ github.event.inputs.enable_8sgen3_tweaks != 'false' }}
+      - name: Patch Config.json.in (8s Gen 3 optimizations + logging mode)
         run: |
           set -euo pipefail
           python3 - << 'PY'
-          import pathlib, re
+          import json, os, pathlib
 
-          cfg_candidates = list(pathlib.Path("source").rglob("ConfigDefines.inl"))
-          for cfg in cfg_candidates:
-              text = cfg.read_text(encoding="utf-8")
-              orig = text
-              text = re.sub(r'(OPT_BOOL\s*\(\s*VECTORTSOENABLED\s*,\s*)true(\s*,)', r'\1false\2', text)
-              text = re.sub(r'(OPT_BOOL\s*\(\s*MEMCPYSETTSOENABLED\s*,\s*)true(\s*,)', r'\1false\2', text)
-              text = re.sub(r'(OPT_BOOL\s*\(\s*HALFBARRIERTSOENABLED\s*,\s*)false(\s*,)', r'\1true\2', text)
-              text = re.sub(r'(OPT_BOOL\s*\(\s*MULTIBLOCK\s*,\s*)false(\s*,)', r'\1true\2', text)
-              text = re.sub(r'(OPT_UINT\s*\(\s*MAXINST\s*,\s*)\d+(\s*,)', r'\15000\2', text)
-              if text != orig:
-                  cfg.write_text(text, encoding="utf-8")
-                  print(f"Patched defaults in {cfg}")
+          cfg_path = pathlib.Path("source/FEXCore/Source/Interface/Config/Config.json.in")
+          if not cfg_path.exists():
+              raise SystemExit(f"Config.json.in not found at {cfg_path}")
+
+          data = json.loads(cfg_path.read_text(encoding="utf-8"))
+          opts = data["Options"]
+
+          profile = os.environ["PERF_PROFILE"]
+          log_enabled = os.environ["LOG_ENABLED"] == "true"
+
+          def set_default(section, key, value):
+              if section in opts and key in opts[section]:
+                  old = opts[section][key].get("Default")
+                  opts[section][key]["Default"] = str(value)
+                  print(f"[PATCH] {section}.{key}: {old} -> {value}")
+              else:
+                  print(f"[SKIP]  {section}.{key} not found in this FEX version")
+
+          # --- 1. Ускорение JIT-кэша и снижение статтеров (главное для Cyberpunk 2077) ---
+          # Включаем L2-кэш JIT (по умолчанию отключён ради экономии ОЗУ)
+          set_default("Emulation", "DisableL2Cache", "false")
+          # Отключаем динамическое сжатие L1-кэша JIT (убирает микрофризы при смене сцен)
+          set_default("Emulation", "DynamicL1Cache", "false")
+          # Включаем дисковый кэш скомпилированных JIT-блоков
+          set_default("CPU", "DiskCache", "true")
+          set_default("CPU", "DiskCacheFileMapping", "true")
+          set_default("CPU", "Multiblock", "true")
+          set_default("CPU", "MaxInst", "5000")
+          set_default("CPU", "SmallTSCScale", "true")
+          set_default("CPU", "HideHybrid", "true")
+
+          # --- 2. Оптимизации TSO и x87 под Snapdragon 8s Gen 3 (без FEAT_LRCPC3) ---
+          set_default("Hacks", "VectorTSOEnabled", "false")
+          set_default("Hacks", "MemcpySetTSOEnabled", "false")
+          set_default("Hacks", "HalfBarrierTSOEnabled", "true")
+          set_default("Hacks", "VolatileMetadata", "true")
+          set_default("Hacks", "KernelUnalignedAtomicBackpatching", "true")
+          set_default("Hacks", "X87ReducedPrecision", "true")
+
+          if profile == "max_fps":
+              # Отключение полного TSO даёт самый сильный прирост CPU FPS на Snapdragon без LRCPC3
+              set_default("Hacks", "TSOEnabled", "false")
+          else:
+              set_default("Hacks", "TSOEnabled", "true")
+
+          # --- 3. Режим логирования / телеметрии vs чистая сборка без оверхеда ---
+          if log_enabled:
+              set_default("Logging", "SilentLog", "false")
+              set_default("Logging", "OutputLog", "D:\\fexcore.log")
+              set_default("Logging", "TelemetryDirectory", "D:\\fex_telemetry")
+              set_default("Logging", "ProfileStats", "true")
+              set_default("Debug", "DisableTelemetry", "false")
+          else:
+              set_default("Logging", "SilentLog", "true")
+              set_default("Logging", "ProfileStats", "false")
+              set_default("Debug", "DisableTelemetry", "true")
+
+          cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          print("Config.json.in updated successfully.")
           PY
 
       - name: Build FEXCore PE DLLs (ARM64EC + WOW64)
@@ -117,6 +179,11 @@ jobs:
           TOOLCHAIN="$PWD/Data/CMake/toolchain_mingw.cmake"
           [ -f "$TOOLCHAIN" ] || TOOLCHAIN="$PWD/toolchain_mingw.cmake"
 
+          EXTRA_C_FLAGS="-O3 -DNDEBUG"
+          if [ "$LOG_ENABLED" = "true" ]; then
+            EXTRA_C_FLAGS="-O3 -DNDEBUG -g"
+          fi
+
           build_dll() {
             local triple="$1"
             local stage="$2"
@@ -124,6 +191,8 @@ jobs:
             rm -rf "$dir" && mkdir -p "$dir"
             cmake -S . -B "$dir" -G Ninja -Wno-dev \
               -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_FLAGS_RELEASE="$EXTRA_C_FLAGS" \
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
               -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
               -DMINGW_TRIPLE="${triple}-w64-mingw32" \
               -DCMAKE_INSTALL_PREFIX=/usr \
@@ -153,10 +222,7 @@ jobs:
             exit 0
           fi
 
-          OPT_FLAGS="-O3"
-          if [ "${{ github.event.inputs.enable_8sgen3_tweaks != 'false' }}" = "true" ]; then
-            OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto -mtune=cortex-x4"
-          fi
+          OPT_FLAGS="-O3 -march=armv8.2-a+fp16+dotprod+rcpc+lse+crypto -mtune=cortex-x4"
 
           if [ "$LIBC" = "bionic" ]; then
             NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
@@ -243,7 +309,11 @@ jobs:
           DLL_WOW=$(find stage-wow -type f -name '*.dll' | head -n 1)
           cp "$DLL_EC" "$PKG/system32/libarm64ecfex.dll"
           cp "$DLL_WOW" "$PKG/system32/libwow64fex.dll"
-          /opt/llvm-mingw/bin/llvm-strip --strip-all "$PKG/system32"/*.dll
+
+          # В сборке без лога полностью вырезаем символы; в лог-сборке сохраняем C-отладку
+          if [ "$LOG_ENABLED" != "true" ]; then
+            /opt/llvm-mingw/bin/llvm-strip --strip-all "$PKG/system32"/*.dll
+          fi
 
           if [ "$HAS_UNIXLIB" = "1" ]; then
             mkdir -p "$PKG/aarch64-unix"
@@ -257,7 +327,7 @@ jobs:
             jq -n \
               --arg vn "${PKG_NAME}" \
               --argjson vc "${GITHUB_RUN_NUMBER}" \
-              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), tuned for Snapdragon 8s Gen 3" \
+              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}) + unixlib (${LIBC}), 8s Gen 3 ${PERF_PROFILE}, log=${LOG_ENABLED}" \
               '{
                 type: "FEXCore",
                 versionName: $vn,
@@ -275,7 +345,7 @@ jobs:
             jq -n \
               --arg vn "${PKG_NAME}" \
               --argjson vc "${GITHUB_RUN_NUMBER}" \
-              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), tuned for Snapdragon 8s Gen 3 (DLL-only)" \
+              --arg desc "FEXCore ${VER_CLEAN} (${COMMIT_SHORT}), 8s Gen 3 ${PERF_PROFILE}, log=${LOG_ENABLED} (DLL-only)" \
               '{
                 type: "FEXCore",
                 versionName: $vn,
@@ -318,8 +388,9 @@ jobs:
           body: |
             ### FEXCore для Winlator-Ludashi (Snapdragon 8s Gen 3)
             - **Версия FEX**: `${{ env.FEX_REF }}` (`${{ env.COMMIT_SHORT }}`)
+            - **Профиль**: `${{ env.PERF_PROFILE }}` (L1/L2 JIT-кэш + DiskCache + Fast x87)
+            - **Логирование FEX**: `${{ env.LOG_ENABLED }}` (`D:\fexcore.log` и `D:\fex_telemetry` при включении)
             - **UnixLib**: `${{ env.LIBC }}` (`HAS_UNIXLIB=${{ env.HAS_UNIXLIB }}`)
-            - **Оптимизации 8s Gen 3**: `${{ github.event.inputs.enable_8sgen3_tweaks }}`
             - **Установка**: Winlator → **Settings → Contents → Install Content** → выберите `${{ env.PKG_NAME }}.wcp`.
           files: out/*.wcp
         env:
