@@ -237,5 +237,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ env.PKG_TAG }}" "${{ env.PKG_FILE }}" \
+            --repo "${{ github.repository }}" \
             --title "VKD3D-Proton ${{ inputs.vkd3d_tag }} ARM64EC (8s Gen 3)" \
             --notes "Native ARM64EC build of VKD3D-Proton ${{ inputs.vkd3d_tag }} tuned for Snapdragon 8s Gen 3 (Winlator .wcp)."
