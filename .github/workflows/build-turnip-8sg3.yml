@@ -1,0 +1,175 @@
+name: Build Mesa Turnip (Adrenotools .zip) for Snapdragon 8s Gen 3
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch or tag (e.g. main or mesa-26.2.3)"
+        required: true
+        default: "main"
+      enable_lto:
+        description: "Enable ThinLTO (-flto=thin) for faster CPU driver & shader compile"
+        type: boolean
+        default: true
+      create_release:
+        description: "Create GitHub Release for easy phone download"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-turnip-8sg3:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl unzip zip patchelf flex bison clang lld pkg-config \
+            ninja-build python3 python3-pip glslang-tools
+          pip3 install --upgrade --break-system-packages meson mako pyyaml
+          meson --version
+
+      - name: Locate or download Android NDK
+        run: |
+          set -euo pipefail
+          NDK_DIR="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK_DIR" ] || [ ! -d "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin" ]; then
+            echo "Preinstalled NDK not found, downloading android-ndk-r27c..."
+            curl -fSL "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip" -o /tmp/ndk.zip
+            unzip -q /tmp/ndk.zip -d "$HOME"
+            rm -f /tmp/ndk.zip
+            NDK_DIR="$HOME/android-ndk-r27c"
+          fi
+          echo "Using NDK: $NDK_DIR"
+          NDK_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+          "$NDK_BIN/aarch64-linux-android34-clang" --version
+
+      - name: Clone Mesa (${{ inputs.mesa_ref }})
+        run: |
+          git clone --depth 1 --branch "${{ inputs.mesa_ref }}" \
+            https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          MESA_VER=$(cat mesa/VERSION | tr -d '[:space:]')
+          MESA_SHA=$(git -C mesa rev-parse --short HEAD)
+          echo "MESA_VER=$MESA_VER" >> "$GITHUB_ENV"
+          echo "MESA_SHA=$MESA_SHA" >> "$GITHUB_ENV"
+          echo "Building Mesa $MESA_VER ($MESA_SHA)"
+
+      - name: Create Meson cross & native files (tuned for 8s Gen 3)
+        run: |
+          mkdir -p "$NDK_DIR/pkg-config"
+
+          if [ "${{ inputs.enable_lto }}" = "true" ]; then
+            LTO_ARG=", '-flto=thin'"
+          else
+            LTO_ARG=""
+          fi
+
+          cat > mesa/android-aarch64-8sg3.txt << EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['$NDK_BIN/aarch64-linux-android34-clang', '-Wno-deprecated-declarations', '-Wno-gnu-alignof-expression']
+          cpp = ['$NDK_BIN/aarch64-linux-android34-clang++', '--start-no-unused-arguments', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++', '--end-no-unused-arguments', '-Wno-error=c++11-narrowing', '-Wno-deprecated-declarations', '-Wno-gnu-alignof-expression']
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          strip = '$NDK_BIN/llvm-strip'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=$NDK_DIR/pkg-config', '/usr/bin/pkg-config']
+
+          [built-in options]
+          c_args = ['-O3', '-march=armv8.4-a+lse+rcpc+fp16+dotprod+flagm', '-mtune=cortex-a720', '-fno-math-errno', '-fno-trapping-math', '-ffunction-sections', '-fdata-sections'${LTO_ARG}]
+          cpp_args = ['-O3', '-march=armv8.4-a+lse+rcpc+fp16+dotprod+flagm', '-mtune=cortex-a720', '-fno-math-errno', '-fno-trapping-math', '-ffunction-sections', '-fdata-sections'${LTO_ARG}]
+          c_link_args = ['-Wl,--gc-sections', '-Wl,--icf=safe'${LTO_ARG}]
+          cpp_link_args = ['-Wl,--gc-sections', '-Wl,--icf=safe'${LTO_ARG}]
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+          cat > mesa/native.txt << 'EOF'
+          [binaries]
+          c = 'clang'
+          cpp = 'clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'lld'
+          cpp_ld = 'lld'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+      - name: Configure and build Turnip (libvulkan_freedreno.so)
+        working-directory: mesa
+        run: |
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64-8sg3.txt \
+            --native-file native.txt \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=34 \
+            -Dandroid-stub=true \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Degl=disabled \
+            -Dglx=disabled \
+            -Dstrip=true
+          ninja -C build-android-aarch64 -j"$(nproc)" src/freedreno/vulkan/libvulkan_freedreno.so
+
+      - name: Package Adrenotools .zip
+        run: |
+          set -euo pipefail
+          mkdir -p pack dist
+          cp mesa/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so pack/vulkan.turnip.so
+          "$NDK_BIN/llvm-strip" --strip-unneeded pack/vulkan.turnip.so
+          patchelf --set-soname vulkan.turnip.so pack/vulkan.turnip.so
+
+          cat > pack/meta.json << EOF
+          {
+            "schemaVersion": 1,
+            "name": "Turnip ${MESA_VER}-${MESA_SHA} (8sGen3)",
+            "description": "Mesa Turnip ${MESA_VER} (${MESA_SHA}) built with -O3, ThinLTO, armv8.4-a & cortex-a720 tuning for Snapdragon 8s Gen 3 (Adreno 735)",
+            "author": "custom-8sGen3",
+            "packageVersion": "1",
+            "vendor": "Mesa3D",
+            "driverVersion": "Vulkan 1.4 (${MESA_VER})",
+            "minApi": 34,
+            "libraryName": "vulkan.turnip.so"
+          }
+          EOF
+
+          python3 -m json.tool pack/meta.json > /dev/null
+          ZIP_NAME="Turnip-${MESA_VER}-${MESA_SHA}-8sGen3.zip"
+          (cd pack && zip -9 "../dist/${ZIP_NAME}" vulkan.turnip.so meta.json)
+
+          echo "ZIP_FILE=dist/${ZIP_NAME}" >> "$GITHUB_ENV"
+          echo "REL_TAG=turnip-${MESA_VER}-${MESA_SHA}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          ls -lh "dist/${ZIP_NAME}"
+
+      - name: Upload Adrenotools .zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Turnip-8sGen3-Adrenotools
+          path: ${{ env.ZIP_FILE }}
+
+      - name: Create GitHub Release (easy phone download)
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ env.REL_TAG }}" "${{ env.ZIP_FILE }}" \
+            --repo "${{ github.repository }}" \
+            --title "Mesa Turnip ${{ env.MESA_VER }} (${{ env.MESA_SHA }}) — 8s Gen 3" \
+            --notes "Adrenotools .zip of Mesa Turnip ${{ env.MESA_VER }} (${{ env.MESA_SHA }}) tuned for Snapdragon 8s Gen 3 (Adreno 735)."
