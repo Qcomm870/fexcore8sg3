@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mesa_ref:
-        description: "Mesa branch or tag (e.g. main or mesa-26.2.3)"
+        description: "Mesa branch or tag (e.g. main or mesa-26.3.1)"
         required: true
         default: "main"
       enable_lto:
@@ -97,8 +97,8 @@ jobs:
           [binaries]
           c = 'clang'
           cpp = 'clang++'
-          ar = 'llvm-ar'
-          strip = 'llvm-strip'
+          ar = 'ar'
+          strip = 'strip'
           c_ld = 'lld'
           cpp_ld = 'lld'
 
