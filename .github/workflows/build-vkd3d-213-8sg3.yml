@@ -31,9 +31,11 @@ jobs:
             git curl xz-utils tar zstd python3 meson ninja-build glslang-tools
 
       - name: Setup llvm-mingw (ARM64EC + i686 UCRT toolchain)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          LLVM_URL=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+          LLVM_URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest \
             | python3 -c "import sys, json; assets = json.load(sys.stdin)['assets']; print(next(a['browser_download_url'] for a in assets if 'ucrt-ubuntu' in a['name'] and 'x86_64.tar.xz' in a['name']))")
           echo "Downloading $LLVM_URL"
           curl -fSL "$LLVM_URL" -o /tmp/llvm-mingw.tar.xz
