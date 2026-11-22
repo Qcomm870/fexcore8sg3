@@ -1,0 +1,224 @@
+name: Build VKD3D-Proton 2.13 ARM64EC (.wcp) for Snapdragon 8s Gen 3
+
+on:
+  workflow_dispatch:
+    inputs:
+      vkd3d_tag:
+        description: "VKD3D-Proton git tag"
+        required: true
+        default: "v2.13"
+      silence_swapchain_spam:
+        description: "Patch out vkd3d_waiting_event_signal / frame latency ERR spam"
+        type: boolean
+        default: true
+      create_release:
+        description: "Create GitHub Release for easy phone download"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-vkd3d-arm64ec:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl xz-utils tar zstd python3 meson ninja-build glslang-tools
+
+      - name: Setup llvm-mingw (ARM64EC + i686 UCRT toolchain)
+        run: |
+          set -euo pipefail
+          LLVM_URL=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+            | python3 -c "import sys, json; assets = json.load(sys.stdin)['assets']; print(next(a['browser_download_url'] for a in assets if 'ucrt-ubuntu' in a['name'] and 'x86_64.tar.xz' in a['name']))")
+          echo "Downloading $LLVM_URL"
+          curl -fSL "$LLVM_URL" -o /tmp/llvm-mingw.tar.xz
+          mkdir -p "$HOME/llvm-mingw"
+          tar -xf /tmp/llvm-mingw.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
+          rm -f /tmp/llvm-mingw.tar.xz
+          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
+          "$HOME/llvm-mingw/bin/arm64ec-w64-mingw32-gcc" --version
+
+      - name: Clone VKD3D-Proton (${{ inputs.vkd3d_tag }})
+        run: |
+          git clone --recursive --depth 1 --branch "${{ inputs.vkd3d_tag }}" \
+            https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d-proton
+
+      - name: Apply Snapdragon 8s Gen 3 tweaks
+        if: ${{ inputs.silence_swapchain_spam }}
+        run: |
+          python3 - << 'PY'
+          import pathlib
+
+          root = pathlib.Path("vkd3d-proton/libs/vkd3d")
+          targets = [
+              ('ERR("Failed to signal event, hr #%x.\\n"', 'TRACE("Failed to signal event, hr #%x.\\n"'),
+              ('ERR("Failed to enqueue frame latency event, hr %#x.\\n"', 'TRACE("Failed to enqueue frame latency event, hr %#x.\\n"'),
+          ]
+          patched = 0
+          for path in root.rglob("*.c"):
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              updated = text
+              for old, new in targets:
+                  if old in updated:
+                      updated = updated.replace(old, new)
+                      patched += 1
+              if updated != text:
+                  path.write_text(updated, encoding="utf-8")
+                  print(f"Patched {path}")
+          print(f"Total replacements applied: {patched}")
+          PY
+
+      - name: Create Meson cross-files (ARM64EC tuned for 8s Gen 3 + i686)
+        run: |
+          cat > vkd3d-proton/build-arm64ec-8sg3.txt << 'EOF'
+          [binaries]
+          c = 'arm64ec-w64-mingw32-gcc'
+          cpp = 'arm64ec-w64-mingw32-g++'
+          ar = 'arm64ec-w64-mingw32-ar'
+          strip = 'arm64ec-w64-mingw32-strip'
+          widl = 'arm64ec-w64-mingw32-widl'
+          windres = 'arm64ec-w64-mingw32-windres'
+
+          [built-in options]
+          c_args = ['-O3', '-march=armv8.2-a+lse+rcpc+fp16+dotprod', '-mtune=cortex-a720', '-fno-math-errno']
+          cpp_args = ['-O3', '-march=armv8.2-a+lse+rcpc+fp16+dotprod', '-mtune=cortex-a720', '-fno-math-errno']
+          c_link_args = ['-static', '-static-libgcc']
+          cpp_link_args = ['-static', '-static-libgcc', '-static-libstdc++']
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+          cat > vkd3d-proton/build-i686-llvm.txt << 'EOF'
+          [binaries]
+          c = 'i686-w64-mingw32-gcc'
+          cpp = 'i686-w64-mingw32-g++'
+          ar = 'i686-w64-mingw32-ar'
+          strip = 'i686-w64-mingw32-strip'
+          widl = 'i686-w64-mingw32-widl'
+          windres = 'i686-w64-mingw32-windres'
+
+          [built-in options]
+          c_args = ['-O3', '-fno-math-errno']
+          cpp_args = ['-O3', '-fno-math-errno']
+          c_link_args = ['-static', '-static-libgcc']
+          cpp_link_args = ['-static', '-static-libgcc', '-static-libstdc++']
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'x86'
+          cpu = 'i686'
+          endian = 'little'
+          EOF
+
+      - name: Build VKD3D-Proton ARM64EC (64-bit)
+        working-directory: vkd3d-proton
+        run: |
+          meson setup build-arm64ec \
+            --cross-file build-arm64ec-8sg3.txt \
+            --buildtype release \
+            --prefix "$PWD/install-arm64ec" \
+            -Denable_tests=false \
+            -Denable_profiling=false \
+            -Denable_renderdoc=false \
+            -Denable_extras=false \
+            -Dstrip=true
+          ninja -C build-arm64ec -j"$(nproc)" install
+
+      - name: Build VKD3D-Proton i686 (32-bit fallback)
+        working-directory: vkd3d-proton
+        run: |
+          meson setup build-i686 \
+            --cross-file build-i686-llvm.txt \
+            --buildtype release \
+            --prefix "$PWD/install-i686" \
+            -Denable_tests=false \
+            -Denable_profiling=false \
+            -Denable_renderdoc=false \
+            -Denable_extras=false \
+            -Dstrip=true
+          ninja -C build-i686 -j"$(nproc)" install
+
+      - name: Package .wcp (Winlator / Bionic format)
+        run: |
+          set -euo pipefail
+          VER_CLEAN="${{ inputs.vkd3d_tag }}"
+          VER_CLEAN="${VER_CLEAN#v}"
+          PKG_NAME="vkd3d-proton-${VER_CLEAN}-8sGen3-arm64ec"
+
+          mkdir -p wcp_stage/system32 wcp_stage/syswow64
+          cp vkd3d-proton/install-arm64ec/bin/d3d12.dll wcp_stage/system32/
+          cp vkd3d-proton/install-arm64ec/bin/d3d12core.dll wcp_stage/system32/
+          cp vkd3d-proton/install-i686/bin/d3d12.dll wcp_stage/syswow64/
+          cp vkd3d-proton/install-i686/bin/d3d12core.dll wcp_stage/syswow64/
+
+          llvm-strip --strip-all \
+            wcp_stage/system32/d3d12.dll \
+            wcp_stage/system32/d3d12core.dll \
+            wcp_stage/syswow64/d3d12.dll \
+            wcp_stage/syswow64/d3d12core.dll
+
+          cat > wcp_stage/profile.json << EOF
+          {
+            "type": "VKD3D",
+            "versionName": "${VER_CLEAN}-8sGen3-arm64ec",
+            "versionCode": 0,
+            "description": "VKD3D-Proton ${VER_CLEAN} ARM64EC tuned for Snapdragon 8s Gen 3",
+            "files": [
+              {
+                "source": "system32/d3d12.dll",
+                "target": "\${system32}/d3d12.dll"
+              },
+              {
+                "source": "system32/d3d12core.dll",
+                "target": "\${system32}/d3d12core.dll"
+              },
+              {
+                "source": "syswow64/d3d12.dll",
+                "target": "\${syswow64}/d3d12.dll"
+              },
+              {
+                "source": "syswow64/d3d12core.dll",
+                "target": "\${syswow64}/d3d12core.dll"
+              }
+            ]
+          }
+          EOF
+
+          python3 -m json.tool wcp_stage/profile.json > /dev/null
+          mkdir -p dist
+          tar --owner=0 --group=0 -C wcp_stage -cf - profile.json system32 syswow64 \
+            | zstd -19 -T0 -o "dist/${PKG_NAME}.wcp"
+
+          echo "PKG_FILE=dist/${PKG_NAME}.wcp" >> "$GITHUB_ENV"
+          echo "PKG_TAG=vkd3d-${VER_CLEAN}-8sg3-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          ls -lh "dist/${PKG_NAME}.wcp"
+
+      - name: Upload .wcp Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkd3d-proton-2.13-8sGen3-arm64ec
+          path: ${{ env.PKG_FILE }}
+
+      - name: Create GitHub Release (easy phone download)
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ env.PKG_TAG }}" "${{ env.PKG_FILE }}" \
+            --title "VKD3D-Proton ${{ inputs.vkd3d_tag }} ARM64EC (8s Gen 3)" \
+            --notes "Native ARM64EC build of VKD3D-Proton ${{ inputs.vkd3d_tag }} tuned for Snapdragon 8s Gen 3 (Winlator .wcp)."
