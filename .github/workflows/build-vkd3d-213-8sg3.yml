@@ -1,4 +1,4 @@
-name: Build VKD3D-Proton 2.13 ARM64EC (.wcp) for Snapdragon 8s Gen 3
+name: Build VKD3D-Proton 2.13 ARM64EC v2 (.wcp) for Snapdragon 8s Gen 3
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
         description: "VKD3D-Proton git tag"
         required: true
         default: "v2.13"
+      enable_lto:
+        description: "Enable ThinLTO (-flto=thin) for cross-file inlining"
+        type: boolean
+        default: true
       silence_swapchain_spam:
         description: "Patch out vkd3d_waiting_event_signal / frame latency ERR spam"
         type: boolean
@@ -92,9 +96,17 @@ jobs:
           print(f"Total replacements applied: {patched}")
           PY
 
-      - name: Create Meson cross-files (ARM64EC tuned for 8s Gen 3 + i686)
+      - name: Create Meson cross-files (ARM64EC v2 tuned for 8s Gen 3 + i686)
         run: |
-          cat > vkd3d-proton/build-arm64ec-8sg3.txt << 'EOF'
+          if [ "${{ inputs.enable_lto }}" = "true" ]; then
+            LTO_FLAG="', '-flto=thin"
+            LTO_LINK="', '-flto=thin"
+          else
+            LTO_FLAG=""
+            LTO_LINK=""
+          fi
+
+          cat > vkd3d-proton/build-arm64ec-8sg3.txt << EOF
           [binaries]
           c = 'arm64ec-w64-mingw32-gcc'
           cpp = 'arm64ec-w64-mingw32-g++'
@@ -104,10 +116,10 @@ jobs:
           windres = 'arm64ec-w64-mingw32-windres'
 
           [built-in options]
-          c_args = ['-O3', '-march=armv8.2-a+lse+rcpc+fp16+dotprod', '-mtune=cortex-a720', '-fno-math-errno']
-          cpp_args = ['-O3', '-march=armv8.2-a+lse+rcpc+fp16+dotprod', '-mtune=cortex-a720', '-fno-math-errno']
-          c_link_args = ['-static', '-static-libgcc']
-          cpp_link_args = ['-static', '-static-libgcc', '-static-libstdc++']
+          c_args = ['-O3', '-DNDEBUG', '-march=armv8.4-a+lse+rcpc+fp16+dotprod+flagm', '-mtune=cortex-a720', '-fno-math-errno', '-fno-trapping-math', '-ffunction-sections', '-fdata-sections${LTO_FLAG}']
+          cpp_args = ['-O3', '-DNDEBUG', '-march=armv8.4-a+lse+rcpc+fp16+dotprod+flagm', '-mtune=cortex-a720', '-fno-math-errno', '-fno-trapping-math', '-ffunction-sections', '-fdata-sections${LTO_FLAG}']
+          c_link_args = ['-static', '-static-libgcc', '-Wl,--gc-sections${LTO_LINK}']
+          cpp_link_args = ['-static', '-static-libgcc', '-static-libstdc++', '-Wl,--gc-sections${LTO_LINK}']
 
           [properties]
           needs_exe_wrapper = true
@@ -129,10 +141,10 @@ jobs:
           windres = 'i686-w64-mingw32-windres'
 
           [built-in options]
-          c_args = ['-O3', '-fno-math-errno']
-          cpp_args = ['-O3', '-fno-math-errno']
-          c_link_args = ['-static', '-static-libgcc']
-          cpp_link_args = ['-static', '-static-libgcc', '-static-libstdc++']
+          c_args = ['-O3', '-DNDEBUG', '-fno-math-errno', '-ffunction-sections', '-fdata-sections']
+          cpp_args = ['-O3', '-DNDEBUG', '-fno-math-errno', '-ffunction-sections', '-fdata-sections']
+          c_link_args = ['-static', '-static-libgcc', '-Wl,--gc-sections']
+          cpp_link_args = ['-static', '-static-libgcc', '-static-libstdc++', '-Wl,--gc-sections']
 
           [properties]
           needs_exe_wrapper = true
@@ -155,6 +167,7 @@ jobs:
             -Denable_profiling=false \
             -Denable_renderdoc=false \
             -Denable_extras=false \
+            -Denable_trace=false \
             -Dstrip=true
           ninja -C build-arm64ec -j"$(nproc)" install
 
@@ -169,6 +182,7 @@ jobs:
             -Denable_profiling=false \
             -Denable_renderdoc=false \
             -Denable_extras=false \
+            -Denable_trace=false \
             -Dstrip=true
           ninja -C build-i686 -j"$(nproc)" install
 
@@ -177,7 +191,7 @@ jobs:
           set -euo pipefail
           VER_CLEAN="${{ inputs.vkd3d_tag }}"
           VER_CLEAN="${VER_CLEAN#v}"
-          PKG_NAME="vkd3d-proton-${VER_CLEAN}-8sGen3-arm64ec"
+          PKG_NAME="vkd3d-proton-${VER_CLEAN}-8sGen3-v2-arm64ec"
 
           mkdir -p wcp_stage/system32 wcp_stage/syswow64
           cp vkd3d-proton/install-arm64ec/bin/d3d12.dll wcp_stage/system32/
@@ -194,9 +208,9 @@ jobs:
           cat > wcp_stage/profile.json << EOF
           {
             "type": "VKD3D",
-            "versionName": "${VER_CLEAN}-8sGen3-arm64ec",
+            "versionName": "${VER_CLEAN}-8sGen3-v2-arm64ec",
             "versionCode": 0,
-            "description": "VKD3D-Proton ${VER_CLEAN} ARM64EC tuned for Snapdragon 8s Gen 3",
+            "description": "VKD3D-Proton ${VER_CLEAN} ARM64EC v2 (ThinLTO, no-trace, armv8.4-a) for Snapdragon 8s Gen 3",
             "files": [
               {
                 "source": "system32/d3d12.dll",
@@ -224,13 +238,13 @@ jobs:
             | zstd -19 -T0 -o "dist/${PKG_NAME}.wcp"
 
           echo "PKG_FILE=dist/${PKG_NAME}.wcp" >> "$GITHUB_ENV"
-          echo "PKG_TAG=vkd3d-${VER_CLEAN}-8sg3-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          echo "PKG_TAG=vkd3d-${VER_CLEAN}-8sg3-v2-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           ls -lh "dist/${PKG_NAME}.wcp"
 
       - name: Upload .wcp Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vkd3d-proton-2.13-8sGen3-arm64ec
+          name: vkd3d-proton-2.13-8sGen3-v2-arm64ec
           path: ${{ env.PKG_FILE }}
 
       - name: Create GitHub Release (easy phone download)
@@ -240,5 +254,5 @@ jobs:
         run: |
           gh release create "${{ env.PKG_TAG }}" "${{ env.PKG_FILE }}" \
             --repo "${{ github.repository }}" \
-            --title "VKD3D-Proton ${{ inputs.vkd3d_tag }} ARM64EC (8s Gen 3)" \
-            --notes "Native ARM64EC build of VKD3D-Proton ${{ inputs.vkd3d_tag }} tuned for Snapdragon 8s Gen 3 (Winlator .wcp)."
+            --title "VKD3D-Proton ${{ inputs.vkd3d_tag }} ARM64EC v2 (8s Gen 3)" \
+            --notes "ARM64EC v2 build of VKD3D-Proton ${{ inputs.vkd3d_tag }} with ThinLTO, -Denable_trace=false, gc-sections, and armv8.4-a tuning for Snapdragon 8s Gen 3."
